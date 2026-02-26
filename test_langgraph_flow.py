@@ -1,8 +1,4 @@
-# test_langgraph_flow.py
- 
 from graph.rag_graph import graph
- 
- 
 def test_query(query: str):
     print("\n" + "=" * 60)
     print("QUERY:", query)
@@ -32,4 +28,4 @@ if __name__ == "__main__":
     test_query("What are the safety precautions?")
  
     # TDS-type question
-    test_query("What is the viscosity value?")
+    test_query("What is the stability and reactivity of HEC Liquid Polymer XPT?")

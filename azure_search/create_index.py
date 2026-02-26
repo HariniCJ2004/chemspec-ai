@@ -22,7 +22,7 @@ index_name = os.getenv("AZURE_SEARCH_INDEX")
 credential = AzureKeyCredential(key)
 index_client = SearchIndexClient(endpoint, credential)
  
-# 🔥 IMPORTANT: Embedding dimension
+# IMPORTANT: Embedding dimension
 # text-embedding-3-small = 1536
 VECTOR_DIMENSIONS = 1536
  
