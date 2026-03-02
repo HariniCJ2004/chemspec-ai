@@ -2,26 +2,27 @@ from typing import TypedDict
 import os
 import json
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from openai import AzureOpenAI
-from typing import Dict, Any 
 from agents.planner_agent import Planner
 from azure_search.search_client import search_documents
  
 load_dotenv()
  
-# ==========================
+# =========================================================
 # Azure OpenAI Client
-# ==========================
+# =========================================================
+ 
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
 )
  
-# ==========================
+# =========================================================
 # Graph State
-# ==========================
+# =========================================================
+ 
 class AgentState(TypedDict):
     query: str
     route: str
@@ -29,87 +30,71 @@ class AgentState(TypedDict):
     answer: str
  
  
-# ==========================
-# Planner Node
-# ==========================
+# =========================================================
+# 1️⃣ Planner Node
+# =========================================================
+ 
 def planner_node(state: AgentState):
  
     planner_instance = Planner()
     route = planner_instance.route_query(state["query"])  # "SDS" or "TDS"
  
-    print("ROUTED TO:", route)
+    print("\n🧠 ROUTED TO:", route)
  
     return {
         "query": state["query"],
-        "route": route,
+        "route": route.lower(),   # normalize once
         "context": "",
         "answer": "",
     }
  
  
-# ==========================
-# Answer Node (Tool Calling)
-# ==========================
+# =========================================================
+# 2️⃣ Answer Node (Tool Calling + Grounded Response)
+# =========================================================
+ 
 def answer_node(state: AgentState):
  
     query = state["query"]
-    route = state["route"]
+    route = state["route"]  # single source of truth
  
-    # Tool schema
+    # -----------------------------------------------------
+    # Tool Schema
+    # -----------------------------------------------------
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "search_documents_tool",
-                "description": "Search relevant chunks from Azure AI Search based on document type.",
+                "description": "Search documents from Azure AI Search",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "User question"
-                        },
-                        "document_type": {
-                            "type": "string",
-                            "enum": ["SDS", "TDS"],
-                            "description": "Document type to search"
+                            "description": "User query"
                         }
                     },
-                    "required": ["query", "document_type"]
-                }
-            }
+                    "required": ["query"]
+                },
+            },
         }
     ]
  
-    system_prompt = """
-You are a strictly document-grounded assistant.
- 
-Use ONLY the exact information explicitly present
-in the retrieved chunks.
- 
-Rules:
-- Do NOT infer.
-- Do NOT assume.
-- Do NOT expand.
-- Do NOT summarize beyond provided text.
-- Do NOT add environmental interpretations unless explicitly written.
- 
-If information is not clearly present in retrieved chunks,
-respond exactly:
- 
-"The retrieved documents do not contain this information."
- 
-Return only supported facts.
-"""
- 
-    # ======================
-    # First Call (Force Tool)
-    # ======================
-    response = client.chat.completions.create(
+    # -----------------------------------------------------
+    # First LLM Call → Force Tool Call
+    # -----------------------------------------------------
+    tool_response = client.chat.completions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query}
+            {
+                "role": "system",
+                "content": "Call the search_documents_tool to retrieve relevant information."
+            },
+            {
+                "role": "user",
+                "content": query
+            }
         ],
         tools=tools,
         tool_choice={
@@ -119,7 +104,7 @@ Return only supported facts.
         temperature=0
     )
  
-    message = response.choices[0].message
+    message = tool_response.choices[0].message
  
     if not message.tool_calls:
         raise Exception("Tool was not called. Retrieval failed.")
@@ -127,37 +112,60 @@ Return only supported facts.
     tool_call = message.tool_calls[0]
     args = json.loads(tool_call.function.arguments)
  
-    # ======================
+    # -----------------------------------------------------
     # Execute Retrieval
-    # ======================
+    # -----------------------------------------------------
     retrieved_chunks = search_documents(
         query=args["query"],
-        document_type=args["document_type"]
+        document_type=route   # injected from planner
     )
  
     if not retrieved_chunks:
-        raise Exception("Azure Search returned no chunks.")
+        return {
+            "query": query,
+            "route": route,
+            "context": "",
+            "answer": "The retrieved documents do not contain this information."
+        }
  
-    # ======================
-    # Clean Context Formatting
-    # ======================
+    # -----------------------------------------------------
+    # Format Retrieved Context
+    # -----------------------------------------------------
     context_text = "\n\n".join(
-        [f"Chunk {i+1}:\n{chunk['content']}"
-         for i, chunk in enumerate(retrieved_chunks)]
+        f"Chunk {i+1}:\n{chunk['content']}"
+        for i, chunk in enumerate(retrieved_chunks)
     )
  
     print("\n--- Retrieved Context Preview ---\n")
-    print(context_text[:1000])  # show preview only
+    print(context_text[:1000])
  
-    # ======================
-    # Second Call (Grounded Answer)
-    # ======================
+    # -----------------------------------------------------
+    # Strict Grounded Answer Call
+    # -----------------------------------------------------
+    system_prompt = """
+You are a strictly document-grounded assistant.
+ 
+Use ONLY the exact information explicitly present in the retrieved context.
+ 
+Rules:
+- Do NOT infer.
+- Do NOT assume.
+- Do NOT expand.
+- Do NOT add external knowledge.
+- Do NOT summarize beyond provided text.
+ 
+If the answer is not clearly present in the context,
+respond exactly with:
+ 
+"The retrieved documents do not contain this information."
+"""
+ 
     final_response = client.chat.completions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
         messages=[
             {
                 "role": "system",
-                "content": "Answer strictly using the retrieved context. Do not hallucinate."
+                "content": system_prompt
             },
             {
                 "role": "user",
@@ -167,8 +175,6 @@ User Question:
  
 Retrieved Context:
 {context_text}
- 
-Provide a clean, structured answer.
 """
             }
         ],
@@ -185,9 +191,10 @@ Provide a clean, structured answer.
     }
  
  
-# ==========================
+# =========================================================
 # Build LangGraph
-# ==========================
+# =========================================================
+ 
 builder = StateGraph(AgentState)
  
 builder.add_node("planner", planner_node)
@@ -195,5 +202,6 @@ builder.add_node("answer", answer_node)
  
 builder.set_entry_point("planner")
 builder.add_edge("planner", "answer")
+builder.add_edge("answer", END)
  
 graph = builder.compile()
